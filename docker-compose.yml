@@ -1,0 +1,22 @@
+services:
+  core:
+    build: ./core
+    environment:
+      APP_ACCESS_TOKEN: ${APP_ACCESS_TOKEN:?Set APP_ACCESS_TOKEN in root .env}
+      DATA_DIR: /data
+      CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - liveclip-data:/data
+    ports:
+      - '8000:8000'
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_CORE_URL: http://localhost:8000
+    ports:
+      - '3000:3000'
+    depends_on:
+      - core
+volumes:
+  liveclip-data:
