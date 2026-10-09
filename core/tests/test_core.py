@@ -80,3 +80,25 @@ def test_api_clip_edit_export_complete(tmp_path):
     out=client.get(f'/media/exports/{eid}.mp4')
     assert out.status_code==200 and len(out.content)>10000
     assert client.post(f'/sessions/{sid}/clips',headers=AUTH,json={'start_seconds':3,'end_seconds':100}).status_code==409
+
+
+def test_real_live_nonzero_pts_outlier_is_not_fake_dvr_hours(tmp_path):
+    from media import normalized_hls_content
+    playlist = tmp_path/'index.m3u8'
+    playlist.write_text('#EXTM3U\n#EXT-X-TARGETDURATION:7409\n#EXT-X-MEDIA-SEQUENCE:0\n'
+                        '#EXTINF:7408.087,\nseg_000000.ts\n'
+                        '#EXTINF:2.049,\nseg_000001.ts\n'
+                        '#EXTINF:2.049,\nseg_000002.ts\n'
+                        '#EXTINF:2.053,\nseg_000003.ts\n'
+                        '#EXTINF:2.052,\nseg_000004.ts\n')
+    segments = parse_hls(playlist)
+    assert len(segments) == 5
+    assert 2.04 < segments[0].duration < 2.06
+    assert 10.2 <= available_duration(playlist) <= 10.3
+    fixed = normalized_hls_content(playlist)
+    assert '#EXT-X-TARGETDURATION:3' in fixed
+    assert '#EXTINF:7408.087' not in fixed
+    snap = tmp_path/'snap.m3u8'
+    write_snapshot(playlist,snap,8)
+    assert 'seg_000004.ts' not in snap.read_text()
+    assert 'seg_000003.ts' in snap.read_text()

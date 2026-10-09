@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from media import parse_hls, available_duration, render_clip, finalize_recording, export_video
+from media import parse_hls, normalized_hls_content, available_duration, render_clip, finalize_recording, export_video
 
 DATA = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "./data")).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
@@ -310,7 +310,7 @@ def media_playlist(sid: str):
     get_session(sid)
     path=playlist_path(sid)
     if not path.exists(): raise HTTPException(404,"DVR buffer not ready")
-    content=path.read_text()
+    content=normalized_hls_content(path)
     # Relative paths will resolve into /media/sessions/{sid}/seg_....ts.
     return Response(content,media_type="application/vnd.apple.mpegurl",headers={"Cache-Control":"no-cache, no-store", "X-Robots-Tag":"noindex"})
 
