@@ -216,3 +216,11 @@ def test_recorder_diagnostics_are_authenticated(tmp_path):
     assert "Unsupported codec" in ok.json()["ffmpeg_tail"]
     assert "stream unavailable" in ok.json()["streamlink_tail"]
     assert client.get("/sessions/00000000-0000-0000-0000-000000000000/diagnostics",headers=AUTH).status_code==404
+
+
+def test_recorder_never_uses_unsupported_hevc_best_profile():
+    from pathlib import Path
+    source=(Path(__file__).resolve().parents[1]/"main.py").read_text()
+    assert 'stream_preference = "h264_origin,h264_hd,h264_sd,h264_ao"' in source
+    assert 'source, "best"' not in source
+    assert "started_recording=False" in source
