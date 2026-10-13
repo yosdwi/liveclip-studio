@@ -180,3 +180,19 @@ def test_repair_archive_and_postlive_clip(tmp_path):
         if c["status"] in ("ready","failed"):break
         time.sleep(.2)
     assert c["status"]=="ready",c
+
+
+def test_legacy_pdt_discontinuity_detected_and_removed(tmp_path):
+    from media import source_clock_discontinuous, normalized_hls_content
+    manifest=tmp_path/"index.m3u8"
+    manifest.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T13:25:25+00:00\nseg_000000.ts\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T14:05:39+00:00\nseg_000001.ts\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T14:05:41+00:00\nseg_000002.ts\n"
+    )
+    for n in range(3): (tmp_path/f"seg_{n:06d}.ts").write_bytes(b"test")
+    assert source_clock_discontinuous(manifest)
+    normalized=normalized_hls_content(manifest)
+    assert "#EXT-X-PROGRAM-DATE-TIME" not in normalized
+    assert "#EXTINF:2.0," in normalized
