@@ -245,7 +245,10 @@ def create_session(body: StartRequest, authorization: str | None = Header(None))
 
 def start_recorder(sid, source, workdir):
     """Pipe Streamlink into ffmpeg. No shell; URL validated before execution."""
-    get_stream = ["streamlink", "--stdout", "--retry-open", "3", source, "best"]
+    # TikTok's 'best' often resolves to h265_origin over FLV. Debian FFmpeg
+    # cannot decode TikTok's enhanced HEVC FLV variant; choose AVC only.
+    stream_preference = "h264_origin,h264_hd,h264_sd,h264_ao"
+    get_stream = ["streamlink", "--stdout", "--retry-open", "3", source, stream_preference]
     ffmpeg = ["ffmpeg","-nostdin","-hide_banner","-loglevel","warning","-fflags","+genpts","-i","pipe:0",
         "-map","0:v:0","-map","0:a?","-vf","setpts=PTS-STARTPTS",
         "-c:v","libx264","-preset","veryfast","-crf","24","-pix_fmt","yuv420p",
@@ -261,8 +264,8 @@ def start_recorder(sid, source, workdir):
         src.stdout.close()
         with LOCK:
             RUNNERS[sid] = (src, proc)
-        with connect() as cx:
-            cx.execute("UPDATE sessions SET status='recording' WHERE id=?",(sid,))
+        # Stay CONNECTING until FFmpeg actually writes its first HLS segment.
+        started_recording=False
         last_progress=time.monotonic()
         previous_size=-1
         while proc.poll() is None and src.poll() is None:
@@ -272,6 +275,11 @@ def start_recorder(sid, source, workdir):
             if current_size>0 and current_size!=previous_size:
                 previous_size=current_size
                 last_progress=time.monotonic()
+                if not started_recording and list(workdir.glob("seg_*.ts")):
+                    with connect() as cx:
+                        cx.execute("UPDATE sessions SET status='recording' WHERE id=? AND status='starting'",(sid,))
+                    started_recording=True
+                    print(f"RECORDER_BUFFER_READY session={sid} stream_preference={stream_preference}",flush=True)
             if time.monotonic()-last_progress>45:
                 with connect() as cx:
                     cx.execute("UPDATE sessions SET error='Stream stalled for 45 seconds' WHERE id=?",(sid,))
