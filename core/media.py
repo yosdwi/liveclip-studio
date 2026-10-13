@@ -182,6 +182,35 @@ def render_archive_clip(source: Path, output: Path, start: float, end: float, ve
     return atomic_video(output,render,end-start)
 
 
+
+def source_clock_discontinuous(manifest: Path) -> bool:
+    """Detect huge TikTok FLV clock jumps before any potentially expensive repair."""
+    from datetime import datetime
+    lines=manifest.read_text(encoding="utf-8").splitlines()
+    durations=[float(x.split(":",1)[1].split(",",1)[0]) for x in lines if x.startswith("#EXTINF:")]
+    if any(x>60 for x in durations[:2]): return True
+    dates=[]
+    for line in lines:
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            try: dates.append(datetime.fromisoformat(line.split(":",1)[1].strip().replace("Z","+00:00")))
+            except ValueError: continue
+    return any(abs((b-a).total_seconds())>30 for a,b in zip(dates,dates[1:]))
+
+
+def source_fps(manifest: Path) -> float:
+    fragments=parse_hls(manifest)
+    if not fragments: return 30.0
+    path=manifest.parent/fragments[0].filename
+    try:
+        p=subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
+            "-show_entries","stream=r_frame_rate","-of","default=noprint_wrappers=1:nokey=1",str(path)],
+            capture_output=True,text=True,timeout=12,check=True)
+        from fractions import Fraction
+        fps=float(Fraction(p.stdout.strip().splitlines()[0]))
+        return fps if 10<=fps<=60 else 30.0
+    except Exception: return 30.0
+
+
 def finalize_recording(manifest: Path, output: Path) -> dict:
     segments=parse_hls(manifest)
     if not segments: raise ValueError("No recorded segments")
@@ -189,16 +218,19 @@ def finalize_recording(manifest: Path, output: Path) -> dict:
     snapshot=manifest.parent/"archive.m3u8"
     write_snapshot(manifest,snapshot,duration+.01)
     try:
+        fps=source_fps(manifest)
         def encode(part,continuous=False):
-            # Fallback for older TikTok streams with broken FLV discontinuities:
-            # video frames and audio samples get monotonic timelines.
-            vf="setpts=N/(30*TB)" if continuous else "setpts=PTS-STARTPTS"
+            # Correct broken timestamps using frame/sample counters. Preserve
+            # actual source FPS so the repair does not speed up 15/25 FPS lives.
+            vf=f"setpts=N/({fps:.5f}*TB)" if continuous else "setpts=PTS-STARTPTS"
             run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y",
                 "-protocol_whitelist","file,crypto,data","-fflags","+genpts",
                 "-i",str(snapshot),"-vf",vf,"-af","asetpts=N/SR/TB" if continuous else "asetpts=PTS-STARTPTS",
                 "-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",
-                "-r","30" if continuous else "30","-c:a","aac","-b:a","128k",
+                "-r",f"{fps:.3f}","-c:a","aac","-b:a","128k",
                 "-movflags","+faststart","-avoid_negative_ts","make_zero",str(part)],timeout=3600)
+        if source_clock_discontinuous(manifest):
+            return atomic_video(output,lambda part:encode(part,True),duration)
         try:
             return atomic_video(output,lambda part:encode(part,False),duration)
         except Exception:
