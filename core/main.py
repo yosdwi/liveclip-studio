@@ -28,7 +28,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from media import parse_hls, normalized_hls_content, available_duration, render_clip, finalize_recording, export_video, generate_poster, verify_media
+from media import parse_hls, normalized_hls_content, available_duration, render_clip, render_archive_clip, finalize_recording, export_video, generate_poster, verify_media
 
 DATA = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "./data")).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
@@ -62,7 +62,7 @@ with connect() as cx:
     CREATE TABLE IF NOT EXISTS exports (id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL);
     """)
     # Worker processes do not survive deploys. Treat old 'recording' as interrupted.
-    cx.execute("UPDATE sessions SET status='interrupted', ended_at=? WHERE status IN ('starting','recording','stopping','finalizing')", (datetime.now(timezone.utc).isoformat(),))
+    cx.execute("UPDATE sessions SET status='interrupted', ended_at=? WHERE status IN ('starting','recording','stopping','finalizing','repairing')", (datetime.now(timezone.utc).isoformat(),))
     cx.execute("UPDATE clips SET status='failed', error='Render interrupted by service restart' WHERE status IN ('queued','rendering')")
     cx.execute("UPDATE exports SET status='failed', error='Export interrupted by service restart' WHERE status IN ('queued','rendering')")
 
@@ -230,7 +230,7 @@ def create_session(body: StartRequest, authorization: str | None = Header(None))
     source = require_source_url(body.url)
     with LOCK:
         with connect() as cx:
-            active=cx.execute("SELECT 1 FROM sessions WHERE status IN ('starting','recording','stopping','finalizing') LIMIT 1").fetchone()
+            active=cx.execute("SELECT 1 FROM sessions WHERE status IN ('starting','recording','stopping','finalizing','repairing') LIMIT 1").fetchone()
         if RUNNERS or active:
             raise HTTPException(409, "One recording is already running. Stop it before starting another.")
         sid = str(uuid4())
@@ -332,6 +332,38 @@ def stop(sid: str, authorization: str | None = Header(None)):
         # Let ffmpeg drain the final buffered segments when source closes.
     return {"status":"stopping"}
 
+
+@app.post("/sessions/{sid}/repair")
+def repair_session(sid: str, authorization: str | None = Header(None)):
+    require_access(authorization)
+    s=get_session(sid)
+    if s["status"] not in ("completed","failed","interrupted"):
+        raise HTTPException(409,"Cannot repair an active recording")
+    if available_duration(playlist_path(sid)) < 2:
+        raise HTTPException(409,"No usable recording segments")
+    with LOCK:
+        if RUNNERS:
+            raise HTTPException(409,"Wait until active recording finishes before archive repair")
+        with connect() as cx:
+            repairing=cx.execute("SELECT 1 FROM sessions WHERE status='repairing' LIMIT 1").fetchone()
+            if repairing: raise HTTPException(409,"One archive repair is already running")
+            cx.execute("UPDATE sessions SET status='repairing',error=NULL WHERE id=?",(sid,))
+        POOL.submit(repair_job,sid,s["status"])
+    return {"status":"repairing","session_id":sid}
+
+def repair_job(sid: str, previous: str):
+    workdir=DATA/"sessions"/sid
+    try:
+        info=finalize_recording(playlist_path(sid),workdir/"full.mp4")
+        (workdir/"full.ready").write_text(json.dumps(info))
+        generate_poster(workdir/"full.mp4",workdir/"poster.jpg")
+        with connect() as cx:
+            cx.execute("UPDATE sessions SET status='completed',error=NULL WHERE id=?",(sid,))
+    except Exception as exc:
+        with connect() as cx:
+            cx.execute("UPDATE sessions SET status=?,error=? WHERE id=?",
+                (previous,"Archive repair failed: "+str(exc)[-500:],sid))
+
 @app.post("/sessions/{sid}/clips")
 def create_clip(sid: str, body: ClipRequest, authorization: str | None = Header(None)):
     require_access(authorization)
@@ -339,6 +371,9 @@ def create_clip(sid: str, body: ClipRequest, authorization: str | None = Header(
     if body.end_seconds - body.start_seconds > 600 or body.end_seconds <= body.start_seconds:
         raise HTTPException(422,"Choose 0–600 seconds")
     buffered=available_duration(playlist_path(sid))
+    state=get_session(sid)["status"]
+    if state in ("completed","failed","interrupted") and not is_full_ready(sid):
+        raise HTTPException(409,"Repair archive first; legacy HLS timebase is unsafe for post-LIVE clips")
     if body.end_seconds > buffered-.05:
         raise HTTPException(409, f"Clip must end before currently buffered tail ({buffered:.1f}s)")
     cid=str(uuid4())
@@ -354,7 +389,11 @@ def render_job(cid):
     outdir.mkdir(parents=True,exist_ok=True)
     with connect() as cx: cx.execute("UPDATE clips SET status='rendering' WHERE id=?",(cid,))
     try:
-        render_clip(manifest,outdir / f"{cid}.mp4",clip["start_seconds"],clip["end_seconds"],bool(clip["vertical"]))
+        if is_full_ready(clip["session_id"]):
+            render_archive_clip(DATA/"sessions"/clip["session_id"]/"full.mp4",
+                outdir/f"{cid}.mp4",clip["start_seconds"],clip["end_seconds"],bool(clip["vertical"]))
+        else:
+            render_clip(manifest,outdir/f"{cid}.mp4",clip["start_seconds"],clip["end_seconds"],bool(clip["vertical"]))
         with connect() as cx: cx.execute("UPDATE clips SET status='ready',error=NULL WHERE id=?",(cid,))
     except Exception as exc:
         (outdir / f"{cid}.mp4").unlink(missing_ok=True)

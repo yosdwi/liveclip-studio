@@ -59,7 +59,7 @@ def test_api_clip_edit_export_complete(tmp_path):
         '-f','hls','-hls_time','2','-hls_list_size','0',
         '-hls_segment_filename',str(session_dir/'seg_%06d.ts'),str(m)],check=True)
     with connect() as cx:
-        cx.execute('INSERT INTO sessions (id,source_url,status,started_at) VALUES (?,?,?,?)',(sid,'https://www.tiktok.com/@fake/live','completed','2026-10-09T12:00:00Z'))
+        cx.execute('INSERT INTO sessions (id,source_url,status,started_at) VALUES (?,?,?,?)',(sid,'https://www.tiktok.com/@fake/live','recording','2026-10-09T12:00:00Z'))
     resp=client.post(f'/sessions/{sid}/clips',headers=AUTH,json={'start_seconds':1,'end_seconds':4,'vertical':False,'title':'Clip 1'})
     assert resp.status_code == 200,resp.text
     cid=resp.json()['id']
@@ -144,3 +144,55 @@ def test_media_urls_are_private_and_expiring():
     assert "?expires=" in ticket.json()["url"] and "sig=" in ticket.json()["url"]
     assert client.get(ticket.json()["url"]).status_code==404
     assert client.get(f"/media/sessions/{sid}/index.m3u8",params={"expires":"1","sig":"no"}).status_code==403
+
+def test_repair_archive_and_postlive_clip(tmp_path):
+    from main import connect, DATA
+    from uuid import uuid4
+    sid=str(uuid4())
+    folder=DATA/"sessions"/sid
+    folder.mkdir(parents=True,exist_ok=True)
+    manifest=folder/"index.m3u8"
+    subprocess.run(["ffmpeg","-hide_banner","-loglevel","error",
+        "-f","lavfi","-i","testsrc2=size=320x240:rate=15",
+        "-f","lavfi","-i","sine=frequency=440:sample_rate=44100",
+        "-t","6","-c:v","libx264","-g","15","-c:a","aac",
+        "-f","hls","-hls_time","2","-hls_list_size","0",
+        "-hls_segment_filename",str(folder/"seg_%06d.ts"),str(manifest)],check=True)
+    with connect() as cx:
+        cx.execute("INSERT INTO sessions(id,source_url,status,started_at) VALUES(?,?,?,?)",
+            (sid,"https://www.tiktok.com/@test/live","completed","2026-10-13T00:00:00Z"))
+    assert client.post(f"/sessions/{sid}/clips",headers=AUTH,
+        json={"start_seconds":.5,"end_seconds":3}).status_code==409
+    response=client.post(f"/sessions/{sid}/repair",headers=AUTH)
+    assert response.status_code==200,response.text
+    for _ in range(80):
+        row=client.get(f"/sessions/{sid}",headers=AUTH).json()
+        if row["status"] in ("completed","failed"): break
+        time.sleep(.2)
+    assert row["status"]=="completed",row
+    assert row["full_ready"]
+    assert (folder/"poster.jpg").exists()
+    clip=client.post(f"/sessions/{sid}/clips",headers=AUTH,
+        json={"start_seconds":.5,"end_seconds":3,"vertical":True,"title":"After repair"})
+    assert clip.status_code==200,clip.text
+    for _ in range(80):
+        c=client.get(f"/clips/{clip.json()['id']}",headers=AUTH).json()
+        if c["status"] in ("ready","failed"):break
+        time.sleep(.2)
+    assert c["status"]=="ready",c
+
+
+def test_legacy_pdt_discontinuity_detected_and_removed(tmp_path):
+    from media import source_clock_discontinuous, normalized_hls_content
+    manifest=tmp_path/"index.m3u8"
+    manifest.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T13:25:25+00:00\nseg_000000.ts\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T14:05:39+00:00\nseg_000001.ts\n"
+        "#EXTINF:2.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-13T14:05:41+00:00\nseg_000002.ts\n"
+    )
+    for n in range(3): (tmp_path/f"seg_{n:06d}.ts").write_bytes(b"test")
+    assert source_clock_discontinuous(manifest)
+    normalized=normalized_hls_content(manifest)
+    assert "#EXT-X-PROGRAM-DATE-TIME" not in normalized
+    assert "#EXTINF:2.0," in normalized
