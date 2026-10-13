@@ -287,7 +287,12 @@ def start_recorder(sid, source, workdir):
         with connect() as cx:
             state = cx.execute("SELECT status FROM sessions WHERE id=?", (sid,)).fetchone()["status"]
         if state != "stopping":
-            error = f"Stream ended (source={src.poll()}, ffmpeg={proc.poll()}); check logs"
+            stderr_text=tail_recorder_log(workdir/"ffmpeg.log",1200)
+            source_text=tail_recorder_log(workdir/"streamlink.log",1200)
+            reason=(stderr_text.strip().splitlines()[-1] if stderr_text.strip() else
+                    source_text.strip().splitlines()[-1] if source_text.strip() else "No error details")
+            error=f"Recorder stopped (Streamlink={src.poll()}, FFmpeg={proc.poll()}): {reason[:450]}"
+            print(f"RECORDER_EXIT session={sid} source={src.poll()} ffmpeg={proc.poll()} reason={reason[:500]}",flush=True)
             with connect() as cx: cx.execute("UPDATE sessions SET status='finalizing', error=? WHERE id=?", (error,sid))
     except Exception as ex:
         with connect() as cx: cx.execute("UPDATE sessions SET status='failed',error=?,ended_at=? WHERE id=?",(str(ex),now(),sid))
@@ -311,6 +316,26 @@ def start_recorder(sid, source, workdir):
         else:
             with connect() as cx:
                 cx.execute("UPDATE sessions SET status='failed',error=COALESCE(error,'No HLS manifest produced; source may be offline'),ended_at=? WHERE id=?",(now(),sid))
+            print(f"RECORDER_FAILED session={sid} segments=0 streamlink={tail_recorder_log(workdir/'streamlink.log',800)[-400:]} ffmpeg={tail_recorder_log(workdir/'ffmpeg.log',800)[-400:]}",flush=True)
+
+def tail_recorder_log(path: Path, limit=5000) -> str:
+    """Read only bounded local diagnostics for an authenticated session."""
+    if not path.is_file(): return ""
+    with path.open("rb") as f:
+        f.seek(0,os.SEEK_END)
+        f.seek(max(0,f.tell()-limit))
+        text=f.read().decode("utf-8","replace")
+    return text[-limit:]
+
+@app.get("/sessions/{sid}/diagnostics")
+def session_diagnostics(sid: str, authorization: str | None = Header(None)):
+    require_access(authorization)
+    s=get_session(sid)
+    folder=DATA/"sessions"/sid
+    return {"id":sid,"status":s["status"],"error":s["error"],
+        "streamlink_tail":tail_recorder_log(folder/"streamlink.log"),
+        "ffmpeg_tail":tail_recorder_log(folder/"ffmpeg.log"),
+        "segments":len(parse_hls(playlist_path(sid)))}
 
 @app.get("/sessions/{sid}")
 def session_detail(sid: str, authorization: str | None = Header(None)):
