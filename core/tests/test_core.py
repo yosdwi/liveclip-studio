@@ -59,7 +59,7 @@ def test_api_clip_edit_export_complete(tmp_path):
         '-f','hls','-hls_time','2','-hls_list_size','0',
         '-hls_segment_filename',str(session_dir/'seg_%06d.ts'),str(m)],check=True)
     with connect() as cx:
-        cx.execute('INSERT INTO sessions (id,source_url,status,started_at) VALUES (?,?,?,?)',(sid,'https://www.tiktok.com/@fake/live','completed','2026-10-09T12:00:00Z'))
+        cx.execute('INSERT INTO sessions (id,source_url,status,started_at) VALUES (?,?,?,?)',(sid,'https://www.tiktok.com/@fake/live','recording','2026-10-09T12:00:00Z'))
     resp=client.post(f'/sessions/{sid}/clips',headers=AUTH,json={'start_seconds':1,'end_seconds':4,'vertical':False,'title':'Clip 1'})
     assert resp.status_code == 200,resp.text
     cid=resp.json()['id']
