@@ -78,7 +78,9 @@ def test_api_clip_edit_export_complete(tmp_path):
         if info['status'] in ('ready','failed'):break
         time.sleep(.2)
     assert info['status']=='ready',info
-    out=client.get(f'/media/exports/{eid}.mp4')
+    access=client.get('/media/access',headers=AUTH,params={'kind':'export','asset_id':eid})
+    assert access.status_code==200
+    out=client.get(access.json()['url'])
     assert out.status_code==200 and len(out.content)>10000
     assert client.post(f'/sessions/{sid}/clips',headers=AUTH,json={'start_seconds':3,'end_seconds':100}).status_code==409
 
@@ -127,3 +129,18 @@ def test_atomic_media_rejects_corruption(tmp_path):
     with pytest.raises(Exception):
         atomic_video(target,lambda part: part.write_bytes(b"bad media"*500))
     assert not target.exists() and not (tmp_path/"broken.partial.mp4").exists()
+
+def test_media_urls_are_private_and_expiring():
+    from main import connect
+    from uuid import uuid4
+    sid=str(uuid4())
+    with connect() as cx:
+        cx.execute("INSERT INTO sessions(id,source_url,status,started_at) VALUES(?,?,?,?)",
+            (sid,"https://www.tiktok.com/@test/live","completed","2026-10-13T00:00:00Z"))
+    assert client.get(f"/media/sessions/{sid}/index.m3u8").status_code==403
+    assert client.get("/media/access",params={"kind":"session","asset_id":sid}).status_code==401
+    ticket=client.get("/media/access",headers=AUTH,params={"kind":"session","asset_id":sid})
+    assert ticket.status_code==200
+    assert "?expires=" in ticket.json()["url"] and "sig=" in ticket.json()["url"]
+    assert client.get(ticket.json()["url"]).status_code==404
+    assert client.get(f"/media/sessions/{sid}/index.m3u8",params={"expires":"1","sig":"no"}).status_code==403

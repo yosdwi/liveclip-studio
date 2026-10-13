@@ -5,6 +5,8 @@ out without moving jobs/metadata to a shared durable queue and media store.
 """
 from __future__ import annotations
 import json
+import hashlib
+import hmac
 import shutil
 import os
 from pathlib import Path
@@ -82,6 +84,44 @@ def get_clip(cid):
         row = cx.execute("SELECT * FROM clips WHERE id=?", (cid,)).fetchone()
     if not row: raise HTTPException(404, "Clip not found")
     return dict(row)
+
+
+def sign_media(scope: str, exp: int) -> str:
+    if not API_TOKEN: raise HTTPException(503,"Media signing not configured")
+    return hmac.new(API_TOKEN.encode(),f"{scope}:{exp}".encode(),hashlib.sha256).hexdigest()
+
+def media_query(scope: str, exp: int) -> str:
+    return f"expires={exp}&sig={sign_media(scope,exp)}"
+
+def require_media_access(request: Request, scope: str) -> int:
+    try: exp=int(request.query_params.get("expires","0"))
+    except ValueError: raise HTTPException(403,"Invalid media signature")
+    if not(time.time() <= exp <= time.time()+86400):
+        raise HTTPException(403,"Media access expired")
+    if not secrets.compare_digest(request.query_params.get("sig",""),sign_media(scope,exp)):
+        raise HTTPException(403,"Media access denied")
+    return exp
+
+@app.get("/media/access")
+def get_media_access(kind: str, asset_id: str, authorization: str | None = Header(None)):
+    require_access(authorization)
+    if kind=="session":
+        get_session(asset_id)
+        base=f"/media/sessions/{asset_id}"
+        path=base+("/full.mp4" if is_full_ready(asset_id) else "/index.m3u8")
+        poster=base+"/poster.jpg"
+    elif kind=="clip":
+        get_clip(asset_id)
+        path=f"/media/clips/{asset_id}.mp4";poster=None
+    elif kind=="export":
+        with connect() as cx:
+            if not cx.execute("SELECT 1 FROM exports WHERE id=?",(asset_id,)).fetchone():
+                raise HTTPException(404,"Export not found")
+        path=f"/media/exports/{asset_id}.mp4";poster=None
+    else: raise HTTPException(422,"Unknown media type")
+    exp=int(time.time())+3600
+    query=media_query(kind+":"+asset_id,exp)
+    return {"url":path+"?"+query,"poster":poster+"?"+query if poster else None,"expires_at":exp}
 
 def playlist_path(sid): return DATA / "sessions" / sid / "index.m3u8"
 
@@ -347,17 +387,21 @@ def load_edit(cid: str, authorization: str | None = Header(None)):
 # Media endpoints permit unguessable UUID access in this single-user POC. Production
 # MUST replace with short-lived signed URLs or cookie-auth proxy; do not index them.
 @app.get("/media/sessions/{sid}/index.m3u8")
-def media_playlist(sid: str):
+def media_playlist(sid: str, request: Request):
     get_session(sid)
+    exp=require_media_access(request,"session:"+sid)
     path=playlist_path(sid)
     if not path.exists(): raise HTTPException(404,"DVR buffer not ready")
     content=normalized_hls_content(path)
+    query=media_query("session:"+sid,exp)
+    content="\n".join(line+"?"+query if re.fullmatch(r"seg_\d{6}\.ts",line) else line for line in content.split("\n"))
     # Relative paths will resolve into /media/sessions/{sid}/seg_....ts.
     return Response(content,media_type="application/vnd.apple.mpegurl",headers={"Cache-Control":"no-cache, no-store", "X-Robots-Tag":"noindex"})
 
 @app.get("/media/sessions/{sid}/{filename}")
-def media_segment(sid: str, filename: str):
+def media_segment(sid: str, filename: str, request: Request):
     get_session(sid)
+    require_media_access(request,"session:"+sid)
     if not re.fullmatch(r"seg_\d{6}\.ts|full\.mp4", filename): raise HTTPException(404)
     path=DATA / "sessions" / sid / filename
     if not path.is_file(): raise HTTPException(404)
@@ -366,15 +410,17 @@ def media_segment(sid: str, filename: str):
     return FileResponse(path,media_type="video/mp2t" if filename.endswith(".ts") else "video/mp4",headers={"Cache-Control":"public, max-age=300", "X-Robots-Tag":"noindex"})
 
 @app.get("/media/sessions/{sid}/poster.jpg")
-def media_poster(sid: str):
+def media_poster(sid: str, request: Request):
     get_session(sid)
+    require_media_access(request,"session:"+sid)
     poster=DATA/"sessions"/sid/"poster.jpg"
     if not poster.is_file(): raise HTTPException(404,"Poster not ready")
     return FileResponse(poster,media_type="image/jpeg",headers={"X-Robots-Tag":"noindex"})
 
 @app.get("/media/clips/{cid}.mp4")
-def media_clip(cid: str):
+def media_clip(cid: str, request: Request):
     get_clip(cid)
+    require_media_access(request,"clip:"+cid)
     path=DATA / "clips" / f"{cid}.mp4"
     if not path.is_file(): raise HTTPException(404)
     return FileResponse(path,media_type="video/mp4",headers={"X-Robots-Tag":"noindex"})
@@ -415,7 +461,8 @@ def list_exports(authorization: str | None = Header(None)):
     with connect() as cx: return [dict(r) for r in cx.execute("SELECT * FROM exports ORDER BY created_at DESC LIMIT 300")]
 
 @app.get("/media/exports/{eid}.mp4")
-def media_export(eid: str):
+def media_export(eid: str, request: Request):
+    require_media_access(request,"export:"+eid)
     with connect() as cx: row=cx.execute("SELECT id FROM exports WHERE id=?",(eid,)).fetchone()
     if not row: raise HTTPException(404)
     path=DATA/"exports"/f"{eid}.mp4"
