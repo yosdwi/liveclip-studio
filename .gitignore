@@ -1,0 +1,11 @@
+node_modules/
+.next/
+__pycache__/
+.pytest_cache/
+.env
+.env.local
+data/
+*.mp4
+*.ts
+!web/**/*.ts
+!web/**/*.tsx

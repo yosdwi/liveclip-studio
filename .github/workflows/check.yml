@@ -1,0 +1,26 @@
+name: Quality checks
+on:
+  push:
+  pull_request:
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install -r core/requirements.txt
+      - run: cd core && pytest -q
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cd web && npm install --no-audit --no-fund
+      - run: cd web && npm run build
+        env:
+          NEXT_PUBLIC_CORE_URL: http://localhost:8000

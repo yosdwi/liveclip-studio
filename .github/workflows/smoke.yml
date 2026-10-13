@@ -1,0 +1,40 @@
+name: Public deployment smoke
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify backend health over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if curl -fsSL --max-time 20 "https://liveclip-core-production.up.railway.app/health" -o /tmp/health.json; then
+              python3 -c 'import json; r=json.load(open("/tmp/health.json")); assert r["status"]=="ok", r; print("CORE 200 /health",r["status"])'
+              break
+            fi
+            if [ "$attempt" -eq 12 ]; then exit 1; fi
+            sleep 10
+          done
+      - name: Verify Next.js app over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if curl -fsSL --max-time 20 "https://liveclip-web-production.up.railway.app/" -o /tmp/page.html && grep -q 'LiveClip' /tmp/page.html; then
+              echo "WEB 200 / contains LiveClip"
+              break
+            fi
+            if [ "$attempt" -eq 12 ]; then echo "Web not reachable or missing LiveClip"; exit 1; fi
+            sleep 10
+          done
+      - name: Verify authentication is enforced
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS --max-time 20 -o /dev/null -w "%{http_code}" "https://liveclip-core-production.up.railway.app/sessions")
+          test "$code" = "401"
+          echo "CORE access control: unauthenticated /sessions -> 401"
