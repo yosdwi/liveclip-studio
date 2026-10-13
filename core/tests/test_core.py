@@ -196,3 +196,23 @@ def test_legacy_pdt_discontinuity_detected_and_removed(tmp_path):
     normalized=normalized_hls_content(manifest)
     assert "#EXT-X-PROGRAM-DATE-TIME" not in normalized
     assert "#EXTINF:2.0," in normalized
+
+
+def test_recorder_diagnostics_are_authenticated(tmp_path):
+    from main import connect, DATA
+    from uuid import uuid4
+    sid=str(uuid4())
+    folder=DATA/"sessions"/sid
+    folder.mkdir(parents=True,exist_ok=True)
+    (folder/"ffmpeg.log").write_text("[error] Unsupported codec\n")
+    (folder/"streamlink.log").write_text("error: stream unavailable\n")
+    with connect() as cx:
+        cx.execute("INSERT INTO sessions(id,source_url,status,started_at,error) VALUES(?,?,?,?,?)",
+            (sid,"https://www.tiktok.com/@testing/live","failed","2026-10-13T00:00:00Z","FFmpeg exited"))
+    assert client.get(f"/sessions/{sid}/diagnostics").status_code==401
+    ok=client.get(f"/sessions/{sid}/diagnostics",headers=AUTH)
+    assert ok.status_code==200
+    assert ok.json()["segments"]==0
+    assert "Unsupported codec" in ok.json()["ffmpeg_tail"]
+    assert "stream unavailable" in ok.json()["streamlink_tail"]
+    assert client.get("/sessions/00000000-0000-0000-0000-000000000000/diagnostics",headers=AUTH).status_code==404
