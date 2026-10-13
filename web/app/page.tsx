@@ -59,10 +59,12 @@ export default function Studio(){
  useEffect(()=>{
   if(!token||!session){setPlaybackUrl('');setPosterUrl('');return}
   let active=true;setPlaybackUrl('');
-  call<{url:string,poster:string|null}>('/media/access?kind=session&asset_id='+encodeURIComponent(session.id))
-   .then(data=>{if(active){setPlaybackUrl(API+data.url);setPosterUrl(data.poster?API+data.poster:'')}})
-   .catch(err=>{if(active)setError('Playback authorization: '+(err as Error).message)});
-  return()=>{active=false};
+  const renew=()=>call<{url:string,poster:string|null}>('/media/access?kind=session&asset_id='+encodeURIComponent(session.id))
+    .then(data=>{if(active){setPlaybackUrl(API+data.url);setPosterUrl(data.poster?API+data.poster:'')}})
+    .catch(err=>{if(active)setError('Playback authorization: '+(err as Error).message)});
+  renew();
+  const renewal=setInterval(renew,45*60*1000);
+  return()=>{active=false;clearInterval(renewal)};
  },[token,session?.id,session?.full_ready,call]);
  useEffect(()=>{
   if(!token||!selectedClip){setClipMediaUrl('');return}

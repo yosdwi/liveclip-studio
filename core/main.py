@@ -128,12 +128,16 @@ def playlist_path(sid): return DATA / "sessions" / sid / "index.m3u8"
 def is_full_ready(sid):
     archive=DATA/"sessions"/sid/"full.mp4"
     ready=DATA/"sessions"/sid/"full.ready"
-    if ready.is_file() and archive.is_file(): return True
+    if ready.is_file() and archive.is_file():
+        poster=DATA/"sessions"/sid/"poster.jpg"
+        if not poster.is_file(): generate_poster(archive,poster)
+        return True
     # Backfill earlier POC recordings rather than hiding the user's archive.
     if archive.is_file():
         try:
             result=verify_media(archive)
             ready.write_text(json.dumps(result))
+            generate_poster(archive,DATA/"sessions"/sid/"poster.jpg")
             return True
         except Exception: return False
     return False

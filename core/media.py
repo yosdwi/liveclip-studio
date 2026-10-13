@@ -117,10 +117,10 @@ def verify_media(path: Path, expected_duration: float | None = None) -> dict:
         raise ValueError(f"Media duration {duration:.2f}s does not match {expected_duration:.2f}s")
     for offset in (min(.3,duration/3), max(.1,duration/2)):
         decoded=subprocess.run(["ffmpeg","-v","error","-ss",str(offset),"-i",str(path),
-          "-map","0:v:0","-frames:v","1","-f","null","-"],
+          "-map","0:v:0","-frames:v","1","-f","image2pipe","-vcodec","mjpeg","pipe:1"],
           capture_output=True,timeout=30)
-        if decoded.returncode:
-            raise ValueError("Video has undecodable frames")
+        if decoded.returncode or len(decoded.stdout)<400:
+            raise ValueError("Video produced no decodable frame")
     return {"duration_seconds":round(duration,3),"width":video.get("width"),"height":video.get("height")}
 
 
