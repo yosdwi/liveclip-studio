@@ -52,23 +52,24 @@ def parse_hls(manifest: Path) -> list[Segment]:
 
 
 def normalized_hls_content(manifest: Path) -> str:
-    """Keep browser DVR timing aligned with the clip selection timebase."""
-    raw = manifest.read_text(encoding="utf-8")
-    segments = parse_hls(manifest)
-    if not segments:
-        return raw
-    lines = raw.splitlines()
-    raw_first = next((float(line.split(":",1)[1].split(",",1)[0]) for line in lines if line.startswith("#EXTINF:")),None)
-    if raw_first is None or abs(segments[0].duration-raw_first) < .001:
-        return raw
-    changed = False
-    result = []
+    """Normalize HLS duration and remove discontinuous source wall-clock tags."""
+    raw=manifest.read_text(encoding="utf-8")
+    segments=parse_hls(manifest)
+    if not segments: return raw
+    lines=raw.splitlines()
+    first=next((float(x.split(":",1)[1].split(",",1)[0]) for x in lines if x.startswith("#EXTINF:")),None)
+    bad_first=first is not None and abs(first-segments[0].duration)>.001
+    result=[]
+    changed=False
     for line in lines:
-        if line.startswith("#EXT-X-TARGETDURATION:"):
-            line = f"#EXT-X-TARGETDURATION:{max(1,int(max(x.duration for x in segments)+0.999))}"
-        elif line.startswith("#EXTINF:") and not changed:
-            line = f"#EXTINF:{segments[0].duration:.6f},"
-            changed = True
+        # TikTok FLV PDT can jump +40 minutes between two 2-second segments.
+        # DVR EVENT playback does not require PDT; keeping it misplaces seeks.
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"): continue
+        if bad_first and line.startswith("#EXT-X-TARGETDURATION:"):
+            line=f"#EXT-X-TARGETDURATION:{max(1,int(max(s.duration for s in segments)+.999))}"
+        elif bad_first and line.startswith("#EXTINF:") and not changed:
+            line=f"#EXTINF:{segments[0].duration:.6f},"
+            changed=True
         result.append(line)
     return "\n".join(result)+"\n"
 
@@ -169,20 +170,39 @@ def render_clip(manifest: Path, output: Path, start: float, end: float, vertical
         temp.unlink(missing_ok=True)
 
 
-def finalize_recording(manifest: Path, output: Path) -> None:
-    segments = parse_hls(manifest)
-    if not segments:
-        return
-    snapshot = manifest.parent / "archive.m3u8"
-    write_snapshot(manifest, snapshot, available_duration(manifest) + .01)
+def render_archive_clip(source: Path, output: Path, start: float, end: float, vertical=False) -> dict:
+    if start < 0 or end <= start or end-start>600:
+        raise ValueError("Invalid archive clip window")
+    def render(part):
+        filters=["-vf",r"crop=trunc(min(iw\,ih*9/16)/2)*2:trunc(min(ih\,iw*16/9)/2)*2:(iw-ow)/2:(ih-oh)/2,scale=720:1280"] if vertical else []
+        run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y",
+            "-ss",f"{start:.3f}","-i",str(source),"-t",f"{end-start:.3f}",*filters,
+            "-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","128k","-movflags","+faststart",str(part)],timeout=420)
+    return atomic_video(output,render,end-start)
+
+
+def finalize_recording(manifest: Path, output: Path) -> dict:
+    segments=parse_hls(manifest)
+    if not segments: raise ValueError("No recorded segments")
+    duration=available_duration(manifest)
+    snapshot=manifest.parent/"archive.m3u8"
+    write_snapshot(manifest,snapshot,duration+.01)
     try:
-        def render(part):
-            run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y","-protocol_whitelist","file,crypto,data",
-                "-fflags","+genpts","-i",str(snapshot),"-vf","setpts=PTS-STARTPTS",
+        def encode(part,continuous=False):
+            # Fallback for older TikTok streams with broken FLV discontinuities:
+            # video frames and audio samples get monotonic timelines.
+            vf="setpts=N/(30*TB)" if continuous else "setpts=PTS-STARTPTS"
+            run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y",
+                "-protocol_whitelist","file,crypto,data","-fflags","+genpts",
+                "-i",str(snapshot),"-vf",vf,"-af","asetpts=N/SR/TB" if continuous else "asetpts=PTS-STARTPTS",
                 "-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",
-                "-c:a","aac","-b:a","128k","-movflags","+faststart","-avoid_negative_ts","make_zero",
-                str(part)],timeout=3600)
-        return atomic_video(output,render,available_duration(manifest))
+                "-r","30" if continuous else "30","-c:a","aac","-b:a","128k",
+                "-movflags","+faststart","-avoid_negative_ts","make_zero",str(part)],timeout=3600)
+        try:
+            return atomic_video(output,lambda part:encode(part,False),duration)
+        except Exception:
+            return atomic_video(output,lambda part:encode(part,True),duration)
     finally:
         snapshot.unlink(missing_ok=True)
 
