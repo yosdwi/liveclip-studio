@@ -62,7 +62,7 @@ with connect() as cx:
     CREATE TABLE IF NOT EXISTS exports (id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL);
     """)
     # Worker processes do not survive deploys. Treat old 'recording' as interrupted.
-    cx.execute("UPDATE sessions SET status='interrupted', ended_at=? WHERE status IN ('starting','recording','stopping','finalizing')", (datetime.now(timezone.utc).isoformat(),))
+    cx.execute("UPDATE sessions SET status='interrupted', ended_at=? WHERE status IN ('starting','recording','stopping','finalizing','repairing')", (datetime.now(timezone.utc).isoformat(),))
     cx.execute("UPDATE clips SET status='failed', error='Render interrupted by service restart' WHERE status IN ('queued','rendering')")
     cx.execute("UPDATE exports SET status='failed', error='Export interrupted by service restart' WHERE status IN ('queued','rendering')")
 
@@ -371,6 +371,9 @@ def create_clip(sid: str, body: ClipRequest, authorization: str | None = Header(
     if body.end_seconds - body.start_seconds > 600 or body.end_seconds <= body.start_seconds:
         raise HTTPException(422,"Choose 0–600 seconds")
     buffered=available_duration(playlist_path(sid))
+    state=get_session(sid)["status"]
+    if state in ("completed","failed","interrupted") and not is_full_ready(sid):
+        raise HTTPException(409,"Repair archive first; legacy HLS timebase is unsafe for post-LIVE clips")
     if body.end_seconds > buffered-.05:
         raise HTTPException(409, f"Clip must end before currently buffered tail ({buffered:.1f}s)")
     cid=str(uuid4())
