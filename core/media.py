@@ -2,6 +2,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import json
+import math
 import re
 import statistics
 import subprocess
@@ -95,6 +98,61 @@ def run_ffmpeg(cmd: list[str], **kwargs) -> None:
         raise RuntimeError(f"FFmpeg exited {exc.returncode}: {output[-1200:]}") from exc
 
 
+
+def verify_media(path: Path, expected_duration: float | None = None) -> dict:
+    """Do not publish a video without confirming decodable video frames."""
+    if not path.is_file() or path.stat().st_size < 1024:
+        raise ValueError("Output media is empty or missing")
+    process = subprocess.run(
+        ["ffprobe","-v","error","-show_entries","format=duration:stream=codec_type,codec_name,width,height,pix_fmt",
+         "-of","json",str(path)],capture_output=True,text=True,timeout=30,check=True)
+    metadata = json.loads(process.stdout)
+    video = next((s for s in metadata.get("streams",[]) if s.get("codec_type")=="video"),None)
+    if not video or video.get("codec_name")!="h264" or video.get("pix_fmt")!="yuv420p":
+        raise ValueError("Video is not compatible H.264 yuv420p")
+    duration=float(metadata.get("format",{}).get("duration") or 0)
+    if not math.isfinite(duration) or duration < .15:
+        raise ValueError("Video duration invalid")
+    if expected_duration is not None and not (max(.1,expected_duration*.5) <= duration <= expected_duration+max(3,expected_duration*.2)):
+        raise ValueError(f"Media duration {duration:.2f}s does not match {expected_duration:.2f}s")
+    for offset in (min(.3,duration/3), max(.1,duration/2)):
+        decoded=subprocess.run(["ffmpeg","-v","error","-ss",str(offset),"-i",str(path),
+          "-map","0:v:0","-frames:v","1","-f","image2pipe","-vcodec","mjpeg","pipe:1"],
+          capture_output=True,timeout=30)
+        if decoded.returncode or len(decoded.stdout)<400:
+            raise ValueError("Video produced no decodable frame")
+    return {"duration_seconds":round(duration,3),"width":video.get("width"),"height":video.get("height")}
+
+
+def atomic_video(output: Path, produce, expected_duration: float | None = None) -> dict:
+    """Write .partial.mp4, verify, only then atomically expose final.mp4."""
+    output.parent.mkdir(parents=True,exist_ok=True)
+    part=output.with_name(output.stem+".partial.mp4")
+    part.unlink(missing_ok=True)
+    try:
+        produce(part)
+        result=verify_media(part,expected_duration)
+        os.replace(part,output)
+        return result
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def generate_poster(video: Path, output: Path) -> bool:
+    temp=output.with_suffix(".partial.jpg")
+    try:
+        run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y",
+            "-ss","0.25","-i",str(video),"-frames:v","1","-q:v","4",str(temp)],timeout=35)
+        if temp.is_file() and temp.stat().st_size>500:
+            os.replace(temp,output)
+            return True
+    except Exception:
+        pass
+    finally:
+        temp.unlink(missing_ok=True)
+    return False
+
+
 def render_clip(manifest: Path, output: Path, start: float, end: float, vertical: bool = False) -> None:
     if start < 0 or end <= start or end - start > 600:
         raise ValueError("Clip duration must be between 0 and 600 seconds")
@@ -106,7 +164,7 @@ def render_clip(manifest: Path, output: Path, start: float, end: float, vertical
     try:
         vf = ["-vf", "crop=trunc(min(iw\\,ih*9/16)/2)*2:trunc(min(ih\\,iw*16/9)/2)*2:(iw-ow)/2:(ih-oh)/2,scale=720:1280"] if vertical else []
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-protocol_whitelist", "file,crypto,data", "-i", str(temp), "-ss", f"{start:.3f}", "-t", f"{end-start:.3f}", *vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
-        run_ffmpeg(cmd, timeout=420, stdout=subprocess.DEVNULL)
+        atomic_video(output, lambda part: run_ffmpeg(cmd[:-1] + [str(part)], timeout=420, stdout=subprocess.DEVNULL), end-start)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -118,7 +176,13 @@ def finalize_recording(manifest: Path, output: Path) -> None:
     snapshot = manifest.parent / "archive.m3u8"
     write_snapshot(manifest, snapshot, available_duration(manifest) + .01)
     try:
-        run_ffmpeg(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-protocol_whitelist", "file,crypto,data", "-i", str(snapshot), "-c", "copy", "-movflags", "+faststart", str(output)], timeout=1800)
+        def render(part):
+            run_ffmpeg(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y","-protocol_whitelist","file,crypto,data",
+                "-fflags","+genpts","-i",str(snapshot),"-vf","setpts=PTS-STARTPTS",
+                "-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",
+                "-c:a","aac","-b:a","128k","-movflags","+faststart","-avoid_negative_ts","make_zero",
+                str(part)],timeout=3600)
+        return atomic_video(output,render,available_duration(manifest))
     finally:
         snapshot.unlink(missing_ok=True)
 
@@ -160,6 +224,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if filters: cmd += ["-vf",",".join(filters)]
     cmd += ["-c:v","libx264","-preset","veryfast","-crf","22","-pix_fmt","yuv420p","-c:a","aac","-b:a","128k","-movflags","+faststart",str(output)]
     try:
-        run_ffmpeg(cmd,timeout=420,cwd=output.parent)
+        return atomic_video(output, lambda part: run_ffmpeg(cmd[:-1]+[str(part)],timeout=420,cwd=output.parent),end-start)
     finally:
         subtitle_path.unlink(missing_ok=True)

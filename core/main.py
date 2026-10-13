@@ -5,6 +5,9 @@ out without moving jobs/metadata to a shared durable queue and media store.
 """
 from __future__ import annotations
 import json
+import hashlib
+import hmac
+import shutil
 import os
 from pathlib import Path
 import re
@@ -25,7 +28,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from media import parse_hls, normalized_hls_content, available_duration, render_clip, finalize_recording, export_video
+from media import parse_hls, normalized_hls_content, available_duration, render_clip, finalize_recording, export_video, generate_poster, verify_media
 
 DATA = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "./data")).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
@@ -82,7 +85,71 @@ def get_clip(cid):
     if not row: raise HTTPException(404, "Clip not found")
     return dict(row)
 
+
+def sign_media(scope: str, exp: int) -> str:
+    if not API_TOKEN: raise HTTPException(503,"Media signing not configured")
+    return hmac.new(API_TOKEN.encode(),f"{scope}:{exp}".encode(),hashlib.sha256).hexdigest()
+
+def media_query(scope: str, exp: int) -> str:
+    return f"expires={exp}&sig={sign_media(scope,exp)}"
+
+def require_media_access(request: Request, scope: str) -> int:
+    try: exp=int(request.query_params.get("expires","0"))
+    except ValueError: raise HTTPException(403,"Invalid media signature")
+    if not(time.time() <= exp <= time.time()+86400):
+        raise HTTPException(403,"Media access expired")
+    if not secrets.compare_digest(request.query_params.get("sig",""),sign_media(scope,exp)):
+        raise HTTPException(403,"Media access denied")
+    return exp
+
+@app.get("/media/access")
+def get_media_access(kind: str, asset_id: str, authorization: str | None = Header(None)):
+    require_access(authorization)
+    if kind=="session":
+        get_session(asset_id)
+        base=f"/media/sessions/{asset_id}"
+        path=base+("/full.mp4" if is_full_ready(asset_id) else "/index.m3u8")
+        poster=base+"/poster.jpg"
+    elif kind=="clip":
+        get_clip(asset_id)
+        path=f"/media/clips/{asset_id}.mp4";poster=None
+    elif kind=="export":
+        with connect() as cx:
+            if not cx.execute("SELECT 1 FROM exports WHERE id=?",(asset_id,)).fetchone():
+                raise HTTPException(404,"Export not found")
+        path=f"/media/exports/{asset_id}.mp4";poster=None
+    else: raise HTTPException(422,"Unknown media type")
+    exp=int(time.time())+3600
+    query=media_query(kind+":"+asset_id,exp)
+    return {"url":path+"?"+query,"poster":poster+"?"+query if poster else None,"expires_at":exp}
+
 def playlist_path(sid): return DATA / "sessions" / sid / "index.m3u8"
+
+def is_full_ready(sid):
+    archive=DATA/"sessions"/sid/"full.mp4"
+    ready=DATA/"sessions"/sid/"full.ready"
+    if ready.is_file() and archive.is_file():
+        poster=DATA/"sessions"/sid/"poster.jpg"
+        if not poster.is_file(): generate_poster(archive,poster)
+        return True
+    # Backfill earlier POC recordings rather than hiding the user's archive.
+    if archive.is_file():
+        try:
+            result=verify_media(archive)
+            ready.write_text(json.dumps(result))
+            generate_poster(archive,DATA/"sessions"/sid/"poster.jpg")
+            return True
+        except Exception: return False
+    return False
+
+def annotate_session(session):
+    sid=session["id"]
+    session["duration_seconds"]=round(available_duration(playlist_path(sid)),2)
+    session["segments"]=len(parse_hls(playlist_path(sid)))
+    session["full_ready"]=is_full_ready(sid)
+    session["poster_ready"]=(DATA/"sessions"/sid/"poster.jpg").is_file()
+    return session
+
 
 def require_source_url(url):
     """Allow only TikTok-hosted HTTPS links, including vt.tiktok.com shortlinks."""
@@ -155,11 +222,7 @@ def list_sessions(authorization: str | None = Header(None)):
     require_access(authorization)
     with connect() as cx:
         sessions = [dict(r) for r in cx.execute("SELECT * FROM sessions ORDER BY started_at DESC LIMIT 100")]
-    for s in sessions:
-        s["duration_seconds"] = round(available_duration(playlist_path(s["id"])), 2)
-        s["segments"] = len(parse_hls(playlist_path(s["id"])))
-        s["full_ready"] = (DATA / "sessions" / s["id"] / "full.mp4").exists()
-    return sessions
+    return [annotate_session(s) for s in sessions]
 
 @app.post("/sessions")
 def create_session(body: StartRequest, authorization: str | None = Header(None)):
@@ -171,6 +234,8 @@ def create_session(body: StartRequest, authorization: str | None = Header(None))
         if RUNNERS or active:
             raise HTTPException(409, "One recording is already running. Stop it before starting another.")
         sid = str(uuid4())
+        if shutil.disk_usage(DATA).free < 750*1024*1024:
+            raise HTTPException(507,"Recorder volume low on free disk; archive older files.")
         workdir = DATA / "sessions" / sid
         workdir.mkdir(parents=True)
         with connect() as cx:
@@ -181,7 +246,13 @@ def create_session(body: StartRequest, authorization: str | None = Header(None))
 def start_recorder(sid, source, workdir):
     """Pipe Streamlink into ffmpeg. No shell; URL validated before execution."""
     get_stream = ["streamlink", "--stdout", "--retry-open", "3", source, "best"]
-    ffmpeg = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event", "-hls_flags", "independent_segments+program_date_time+temp_file", "-hls_segment_filename", str(workdir / "seg_%06d.ts"), str(workdir / "index.m3u8")]
+    ffmpeg = ["ffmpeg","-nostdin","-hide_banner","-loglevel","warning","-fflags","+genpts","-i","pipe:0",
+        "-map","0:v:0","-map","0:a?","-vf","setpts=PTS-STARTPTS",
+        "-c:v","libx264","-preset","veryfast","-crf","24","-pix_fmt","yuv420p",
+        "-force_key_frames","expr:gte(t,n_forced*2)","-c:a","aac","-b:a","128k",
+        "-f","hls","-hls_time","2","-hls_list_size","0","-hls_playlist_type","event",
+        "-hls_flags","independent_segments+program_date_time+temp_file",
+        "-hls_segment_filename",str(workdir/"seg_%06d.ts"),str(workdir/"index.m3u8")]
     src = proc = None
     try:
         src = subprocess.Popen(get_stream, stdout=subprocess.PIPE, stderr=(workdir / "streamlink.log").open("ab"), start_new_session=True)
@@ -192,8 +263,23 @@ def start_recorder(sid, source, workdir):
             RUNNERS[sid] = (src, proc)
         with connect() as cx:
             cx.execute("UPDATE sessions SET status='recording' WHERE id=?",(sid,))
+        last_progress=time.monotonic()
+        previous_size=-1
         while proc.poll() is None and src.poll() is None:
-            time.sleep(.5)
+            time.sleep(1)
+            playlist=workdir/"index.m3u8"
+            current_size=playlist.stat().st_size if playlist.exists() else 0
+            if current_size>0 and current_size!=previous_size:
+                previous_size=current_size
+                last_progress=time.monotonic()
+            if time.monotonic()-last_progress>45:
+                with connect() as cx:
+                    cx.execute("UPDATE sessions SET error='Stream stalled for 45 seconds' WHERE id=?",(sid,))
+                break
+            if shutil.disk_usage(DATA).free<300*1024*1024:
+                with connect() as cx:
+                    cx.execute("UPDATE sessions SET error='Recorder volume low on free disk' WHERE id=?",(sid,))
+                break
         if src.poll() is not None and proc.poll() is None:
             # Give FFmpeg time to flush and close the last HLS segment.
             try: proc.wait(timeout=15)
@@ -216,7 +302,9 @@ def start_recorder(sid, source, workdir):
         if playlist_path(sid).exists():
             with connect() as cx: cx.execute("UPDATE sessions SET status='finalizing' WHERE id=? AND status IN ('stopping','recording')",(sid,))
             try:
-                finalize_recording(playlist_path(sid), workdir / "full.mp4")
+                info=finalize_recording(playlist_path(sid),workdir/"full.mp4")
+                (workdir/"full.ready").write_text(json.dumps(info))
+                generate_poster(workdir/"full.mp4",workdir/"poster.jpg")
                 with connect() as cx: cx.execute("UPDATE sessions SET status='completed',ended_at=? WHERE id=?",(now(),sid))
             except Exception as ex:
                 with connect() as cx: cx.execute("UPDATE sessions SET status='failed',error=?,ended_at=? WHERE id=?",(str(ex),now(),sid))
@@ -228,10 +316,7 @@ def start_recorder(sid, source, workdir):
 def session_detail(sid: str, authorization: str | None = Header(None)):
     require_access(authorization)
     s = get_session(sid)
-    s["duration_seconds"] = round(available_duration(playlist_path(sid)),2)
-    s["segments"] = len(parse_hls(playlist_path(sid)))
-    s["full_ready"] = (DATA / "sessions" / sid / "full.mp4").exists()
-    return s
+    return annotate_session(s)
 
 @app.post("/sessions/{sid}/stop")
 def stop(sid: str, authorization: str | None = Header(None)):
@@ -306,25 +391,40 @@ def load_edit(cid: str, authorization: str | None = Header(None)):
 # Media endpoints permit unguessable UUID access in this single-user POC. Production
 # MUST replace with short-lived signed URLs or cookie-auth proxy; do not index them.
 @app.get("/media/sessions/{sid}/index.m3u8")
-def media_playlist(sid: str):
+def media_playlist(sid: str, request: Request):
     get_session(sid)
+    exp=require_media_access(request,"session:"+sid)
     path=playlist_path(sid)
     if not path.exists(): raise HTTPException(404,"DVR buffer not ready")
     content=normalized_hls_content(path)
+    query=media_query("session:"+sid,exp)
+    content="\n".join(line+"?"+query if re.fullmatch(r"seg_\d{6}\.ts",line) else line for line in content.split("\n"))
     # Relative paths will resolve into /media/sessions/{sid}/seg_....ts.
     return Response(content,media_type="application/vnd.apple.mpegurl",headers={"Cache-Control":"no-cache, no-store", "X-Robots-Tag":"noindex"})
 
 @app.get("/media/sessions/{sid}/{filename}")
-def media_segment(sid: str, filename: str):
+def media_segment(sid: str, filename: str, request: Request):
     get_session(sid)
+    require_media_access(request,"session:"+sid)
     if not re.fullmatch(r"seg_\d{6}\.ts|full\.mp4", filename): raise HTTPException(404)
     path=DATA / "sessions" / sid / filename
     if not path.is_file(): raise HTTPException(404)
+    if filename=="full.mp4" and not is_full_ready(sid):
+        raise HTTPException(409,"Full video is still finalizing")
     return FileResponse(path,media_type="video/mp2t" if filename.endswith(".ts") else "video/mp4",headers={"Cache-Control":"public, max-age=300", "X-Robots-Tag":"noindex"})
 
+@app.get("/media/sessions/{sid}/poster.jpg")
+def media_poster(sid: str, request: Request):
+    get_session(sid)
+    require_media_access(request,"session:"+sid)
+    poster=DATA/"sessions"/sid/"poster.jpg"
+    if not poster.is_file(): raise HTTPException(404,"Poster not ready")
+    return FileResponse(poster,media_type="image/jpeg",headers={"X-Robots-Tag":"noindex"})
+
 @app.get("/media/clips/{cid}.mp4")
-def media_clip(cid: str):
+def media_clip(cid: str, request: Request):
     get_clip(cid)
+    require_media_access(request,"clip:"+cid)
     path=DATA / "clips" / f"{cid}.mp4"
     if not path.is_file(): raise HTTPException(404)
     return FileResponse(path,media_type="video/mp4",headers={"X-Robots-Tag":"noindex"})
@@ -365,7 +465,8 @@ def list_exports(authorization: str | None = Header(None)):
     with connect() as cx: return [dict(r) for r in cx.execute("SELECT * FROM exports ORDER BY created_at DESC LIMIT 300")]
 
 @app.get("/media/exports/{eid}.mp4")
-def media_export(eid: str):
+def media_export(eid: str, request: Request):
+    require_media_access(request,"export:"+eid)
     with connect() as cx: row=cx.execute("SELECT id FROM exports WHERE id=?",(eid,)).fetchone()
     if not row: raise HTTPException(404)
     path=DATA/"exports"/f"{eid}.mp4"
